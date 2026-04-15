@@ -1530,7 +1530,8 @@ void ImageWriter::startWrite()
     _thread->setUserAgent(QString("Mozilla/5.0 rpi-imager/%1").arg(staticVersion()).toUtf8());
     qDebug() << "startWrite: Passing to thread - initFormat:" << _initFormat << "cloudinit empty:" << _cloudinit.isEmpty() << "cloudinitNetwork empty:" << _cloudinitNetwork.isEmpty();
     _thread->setImageCustomisation(_config, _cmdline, _firstrun, _cloudinit, _cloudinitNetwork, _initFormat, _advancedOptions);
-    
+    _thread->setExtraBootFiles(_extraBootFiles);
+
     // Pass debug options to the thread
     _thread->setDebugDirectIO(_debugDirectIO);
     _thread->setDebugPeriodicSync(_debugPeriodicSync);
@@ -1911,6 +1912,16 @@ void ImageWriter::setHWFilterList(const QJsonArray &tags, const bool &inclusive)
     _deviceFilter = tags;
     _deviceFilterIsInclusive = inclusive;
     emit hwFilterChanged();
+}
+
+void ImageWriter::updateCyberFoldState(const QString &deviceName) {
+    bool wasCyberFold = _isCyberFold;
+    _isCyberFold = deviceName.startsWith(QStringLiteral("CyberFold"));
+    _isCyberFoldWithWifi = _isCyberFold && !deviceName.contains(QStringLiteral("CM0"));
+    if (_isCyberFold != wasCyberFold) {
+        qDebug() << "CyberFold device state:" << _isCyberFold << "withWifi:" << _isCyberFoldWithWifi;
+        emit cyberFoldDeviceChanged();
+    }
 }
 
 void ImageWriter::setHWCapabilitiesList(const QJsonArray &json) {
@@ -3494,10 +3505,79 @@ void ImageWriter::applyCustomisationFromSettings(const QVariantMap &settings)
     }
 }
 
+QByteArray ImageWriter::_buildCyberFoldConfigLines(const QVariantMap &s)
+{
+    QByteArray configLines;
+    if (!_isCyberFold)
+        return configLines;
+
+    configLines += "dtoverlay=vc4-kms-dpi-3inch2-1024x768\n";
+    configLines += "dtoverlay=gt911-touch-3inch2-1024x768\n";
+
+    // Antenna selection (CM4/CM5 only, CM0 has no WiFi antenna switch)
+    if (_isCyberFoldWithWifi) {
+        QString antenna = s.value("cyberFoldAntenna").toString();
+        if (antenna == QStringLiteral("external")) {
+            configLines += "dtparam=ant2\n";
+        }
+        // "internal" is the default — no config.txt line needed
+    }
+
+    qDebug() << "CyberFold config.txt lines:" << configLines;
+    return configLines;
+}
+
+void ImageWriter::_loadCyberFoldOverlays()
+{
+    _extraBootFiles.clear();
+    if (!_isCyberFold)
+        return;
+
+    static const QStringList overlayNames = {
+        QStringLiteral("vc4-kms-dpi-3inch2-1024x768.dtbo"),
+        QStringLiteral("gt911-touch-3inch2-1024x768.dtbo"),
+    };
+
+    for (const QString &name : overlayNames) {
+        QFile f(QStringLiteral(":/qt/qml/RpiImager/overlays/") + name);
+        if (f.open(QIODevice::ReadOnly)) {
+            _extraBootFiles.append({QStringLiteral("overlays/") + name, f.readAll()});
+            qDebug() << "Loaded CyberFold overlay:" << name << "(" << _extraBootFiles.last().second.size() << "bytes)";
+        } else {
+            qWarning() << "Failed to load CyberFold overlay resource:" << name;
+        }
+    }
+}
+
 void ImageWriter::_applySystemdCustomisationFromSettings(const QVariantMap &s)
 {
     // Use CustomisationGenerator for script generation
     QByteArray script = rpi_imager::CustomisationGenerator::generateSystemdScript(s, _piConnectToken);
+
+    // Append CyberFold power monitor installation to firstrun.sh
+    if (_isCyberFold && !script.isEmpty()) {
+        QFile monitorFile(QStringLiteral(":/qt/qml/RpiImager/cyberfold/cyberfold_monitor"));
+        if (monitorFile.open(QIODevice::ReadOnly)) {
+            QByteArray monitorContent = monitorFile.readAll();
+            QByteArray monitorInstall = rpi_imager::CustomisationGenerator::generateCyberFoldMonitorInstall(monitorContent);
+            // Insert before the final "rm -f /boot/firstrun.sh" + "exit 0"
+            int exitPos = script.lastIndexOf("\nrm -f /boot/firstrun.sh");
+            if (exitPos >= 0) {
+                script.insert(exitPos, monitorInstall);
+            } else {
+                // Fallback: insert before "exit 0"
+                int exit0Pos = script.lastIndexOf("\nexit 0");
+                if (exit0Pos >= 0)
+                    script.insert(exit0Pos, monitorInstall);
+                else
+                    script += monitorInstall;
+            }
+            qDebug() << "CyberFold monitor install appended to firstrun.sh";
+        }
+    }
+
+    QByteArray configLines = _buildCyberFoldConfigLines(s);
+    _loadCyberFoldOverlays();
 
     QByteArray cmdlineAppend;
     ImageOptions::AdvancedOptions advOpts = NoAdvancedOptions;
@@ -3509,8 +3589,6 @@ void ImageWriter::_applySystemdCustomisationFromSettings(const QVariantMap &s)
         }
 
         // Check if secure boot should be enabled
-        // Note: Don't validate rsaKeyPath with QFile::exists() here - it can be slow on
-        // iCloud-synced or network paths. The actual write operation will validate the file.
         bool secureBootEnabled = s.value("secureBootEnabled").toBool();
         QString rsaKeyPath = _settings.value("secureboot_rsa_key").toString();
         if (secureBootEnabled && !rsaKeyPath.isEmpty()) {
@@ -3519,7 +3597,7 @@ void ImageWriter::_applySystemdCustomisationFromSettings(const QVariantMap &s)
         }
     }
 
-    setImageCustomisation(QByteArray(), cmdlineAppend, script, QByteArray(), QByteArray(), advOpts);
+    setImageCustomisation(configLines, cmdlineAppend, script, QByteArray(), QByteArray(), advOpts);
 }
 
 void ImageWriter::_applyCloudInitCustomisationFromSettings(const QVariantMap &s)
@@ -3527,29 +3605,60 @@ void ImageWriter::_applyCloudInitCustomisationFromSettings(const QVariantMap &s)
     // Use CustomisationGenerator for cloud-init YAML generation
     const bool sshEnabled = s.value("sshEnabled").toBool();
     const bool hasCcRpi = imageSupportsCcRpi();
-    
+
     QByteArray cloud = rpi_imager::CustomisationGenerator::generateCloudInitUserData(
         s, _piConnectToken, hasCcRpi, sshEnabled, getCurrentUser());
-    
+
     QByteArray netcfg = rpi_imager::CustomisationGenerator::generateCloudInitNetworkConfig(
         s, hasCcRpi);
-    
+
+    QByteArray configLines = _buildCyberFoldConfigLines(s);
+    _loadCyberFoldOverlays();
+
+    // For CyberFold: write monitor script to boot partition, add runcmd to install it
+    if (_isCyberFold) {
+        QFile monitorFile(QStringLiteral(":/qt/qml/RpiImager/cyberfold/cyberfold_monitor"));
+        if (monitorFile.open(QIODevice::ReadOnly)) {
+            _extraBootFiles.append({QStringLiteral("cyberfold_monitor"), monitorFile.readAll()});
+
+            // Append runcmd to install the monitor from boot partition
+            QByteArray installCmd;
+            installCmd += "\nruncmd:\n";
+            installCmd += "  - [ sh, -c, \"cp /boot/firmware/cyberfold_monitor /usr/bin/cyberfold_monitor && chmod +x /usr/bin/cyberfold_monitor\" ]\n";
+            installCmd += "  - [ sh, -c, \"apt-get install -y -qq python3-serial 2>/dev/null || true\" ]\n";
+            installCmd += "  - [ sh, -c, \"FIRSTUSER=$(getent passwd 1000 | cut -d: -f1); [ -n \\\"$FIRSTUSER\\\" ] && usermod -aG dialout \\\"$FIRSTUSER\\\"\" ]\n";
+
+            // Check if cloud already has runcmd; if so, merge
+            if (cloud.contains("runcmd:")) {
+                // Insert individual commands after existing runcmd
+                QByteArray cmds;
+                cmds += "  - [ sh, -c, \"cp /boot/firmware/cyberfold_monitor /usr/bin/cyberfold_monitor && chmod +x /usr/bin/cyberfold_monitor\" ]\n";
+                cmds += "  - [ sh, -c, \"apt-get install -y -qq python3-serial 2>/dev/null || true\" ]\n";
+                cmds += "  - [ sh, -c, \"FIRSTUSER=$(getent passwd 1000 | cut -d: -f1); [ -n \\\"$FIRSTUSER\\\" ] && usermod -aG dialout \\\"$FIRSTUSER\\\"\" ]\n";
+                int runcmdPos = cloud.indexOf("runcmd:\n");
+                if (runcmdPos >= 0) {
+                    cloud.insert(runcmdPos + 8, cmds); // After "runcmd:\n"
+                }
+            } else {
+                cloud += installCmd;
+            }
+            qDebug() << "CyberFold monitor added to cloud-init";
+        }
+    }
+
     // Only emit cmdline / advanced options when there is actual content to
     // customise.  A stale persisted recommendedWifiCountry should not cause
     // device writes when customisation was skipped.
     QByteArray cmdlineAppend;
     ImageOptions::AdvancedOptions advOpts = NoAdvancedOptions;
 
-    bool hasContent = !cloud.isEmpty() || !netcfg.isEmpty();
+    bool hasContent = !cloud.isEmpty() || !netcfg.isEmpty() || !configLines.isEmpty();
     if (hasContent) {
         const QString wifiCountry = s.value("recommendedWifiCountry").toString().trimmed();
         if (!wifiCountry.isEmpty()) {
             cmdlineAppend = QByteArray(" ") + QByteArray("cfg80211.ieee80211_regdom=") + wifiCountry.toUtf8();
         }
 
-        // Check if secure boot should be enabled
-        // Note: Don't validate rsaKeyPath with QFile::exists() here - it can be slow on
-        // iCloud-synced or network paths. The actual write operation will validate the file.
         bool secureBootEnabled = s.value("secureBootEnabled").toBool();
         QString rsaKeyPath = _settings.value("secureboot_rsa_key").toString();
         if (secureBootEnabled && !rsaKeyPath.isEmpty()) {
@@ -3558,7 +3667,7 @@ void ImageWriter::_applyCloudInitCustomisationFromSettings(const QVariantMap &s)
         }
     }
 
-    setImageCustomisation(QByteArray(), cmdlineAppend, QByteArray(), cloud, netcfg, advOpts);
+    setImageCustomisation(configLines, cmdlineAppend, QByteArray(), cloud, netcfg, advOpts);
 }
 
 QString ImageWriter::crypt(const QByteArray &password)
@@ -4361,7 +4470,8 @@ void ImageWriter::_continueStartWriteAfterCacheVerification(bool cacheIsValid)
     _thread->setUserAgent(QString("Mozilla/5.0 rpi-imager/%1").arg(staticVersion()).toUtf8());
     qDebug() << "_continueStartWrite: Passing to thread - initFormat:" << _initFormat << "cloudinit empty:" << _cloudinit.isEmpty() << "cloudinitNetwork empty:" << _cloudinitNetwork.isEmpty();
     _thread->setImageCustomisation(_config, _cmdline, _firstrun, _cloudinit, _cloudinitNetwork, _initFormat, _advancedOptions);
-    
+    _thread->setExtraBootFiles(_extraBootFiles);
+
     // Pass debug options to the thread
     _thread->setDebugDirectIO(_debugDirectIO);
     _thread->setDebugPeriodicSync(_debugPeriodicSync);

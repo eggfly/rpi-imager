@@ -58,6 +58,14 @@ WizardStepBase {
         // Prefill from conserved customization settings
         var settings = wizardContainer.customizationSettings
 
+        // Restore CyberFold antenna selection
+        if (imageWriter.isCyberFoldWithWifi && settings.cyberFoldAntenna) {
+            if (settings.cyberFoldAntenna === "external")
+                radioExternalAntenna.checked = true
+            else
+                radioInternalAntenna.checked = true
+        }
+
         // Set SSID placeholder first (before setting any text)
         fieldWifiSSID.placeholderText = qsTr("Network name")
 
@@ -230,6 +238,66 @@ WizardStepBase {
             anchors.margins: Style.sectionPadding
             spacing: Style.stepContentSpacing
             width: wifiScroll.availableWidth
+
+            // CyberFold Antenna Selection (CM4/CM5 only)
+            WizardSectionContainer {
+                visible: imageWriter.isCyberFoldWithWifi
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.spacingSmall
+
+                    Text {
+                        text: qsTr("CyberFold Antenna Configuration")
+                        font.bold: true
+                        font.pointSize: Style.fontSizeTitle
+                        color: Style.formLabelColor
+                        Layout.fillWidth: true
+                    }
+
+                    Text {
+                        text: qsTr("CyberFold devices MUST select an antenna type for WiFi to work. External antenna requires a U.FL antenna connected to the antenna connector.")
+                        font.pointSize: Style.fontSizeDescription
+                        color: Style.formLabelErrorColor
+                        font.bold: true
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+
+                    ButtonGroup {
+                        id: antennaGroup
+                    }
+
+                    RadioButton {
+                        id: radioInternalAntenna
+                        text: qsTr("Internal PCB Antenna (onboard)")
+                        ButtonGroup.group: antennaGroup
+                        font.pointSize: Style.fontSizeInput
+                        onActiveFocusChanged: {
+                            if (activeFocus) wifiScroll.scrollToItem(this);
+                        }
+                    }
+
+                    RadioButton {
+                        id: radioExternalAntenna
+                        text: qsTr("External U.FL Antenna (connected to antenna connector)")
+                        ButtonGroup.group: antennaGroup
+                        font.pointSize: Style.fontSizeInput
+                        onActiveFocusChanged: {
+                            if (activeFocus) wifiScroll.scrollToItem(this);
+                        }
+                    }
+
+                    Text {
+                        visible: imageWriter.isCyberFoldWithWifi && antennaGroup.checkedButton === null
+                        text: qsTr("Please select an antenna type to continue")
+                        font.pointSize: Style.fontSizeDescription
+                        color: Style.formLabelErrorColor
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                }
+            }
 
             WizardSectionContainer {
                 RowLayout {
@@ -425,6 +493,10 @@ WizardStepBase {
     // - SSID entered and either new PSK provided or a saved crypt exists; or
     // - all WiFi fields are empty (skip)
     nextButtonEnabled: (function(){
+        // CyberFold CM4/CM5 requires antenna selection
+        if (imageWriter.isCyberFoldWithWifi && antennaGroup.checkedButton === null)
+            return false
+
         var haveSSID = fieldWifiSSID.text && fieldWifiSSID.text.trim().length > 0
         if (!haveSSID) return true  // allow skipping by leaving fields empty
 
@@ -451,6 +523,12 @@ WizardStepBase {
 
     // Save settings when moving to next step
     onNextClicked: {
+        // Save CyberFold antenna selection
+        if (imageWriter.isCyberFoldWithWifi) {
+            wizardContainer.customizationSettings.cyberFoldAntenna =
+                radioExternalAntenna.checked ? "external" : "internal"
+        }
+
         var ssid = fieldWifiSSID.text ? fieldWifiSSID.text.trim() : ""
         var pwd = fieldWifiPassword.text
         var prevSSID = wizardContainer.customizationSettings.wifiSSID || ""

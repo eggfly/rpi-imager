@@ -50,5 +50,9 @@
         <file>qmlcomponents/ImTextField.qml</file>
         <file>qmlcomponents/ImPasswordField.qml</file>
         <file>qmlcomponents/MarqueeText.qml</file>
+
+        <file>overlays/vc4-kms-dpi-3inch2-1024x768.dtbo</file>
+        <file>overlays/gt911-touch-3inch2-1024x768.dtbo</file>
+        <file>cyberfold/cyberfold_monitor</file>
     </qresource>
 </RCC>

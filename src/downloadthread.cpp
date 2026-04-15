@@ -2195,6 +2195,12 @@ void DownloadThread::setImageCustomisation(const QByteArray &config, const QByte
     qDebug() << "DownloadThread::setImageCustomisation - initFormat:" << initFormat << "cloudinit empty:" << cloudinit.isEmpty() << "cloudinitNetwork empty:" << cloudInitNetwork.isEmpty();
 }
 
+void DownloadThread::setExtraBootFiles(const QList<QPair<QString, QByteArray>> &files)
+{
+    _extraBootFiles = files;
+    qDebug() << "DownloadThread: Extra boot files set:" << files.size();
+}
+
 void DownloadThread::setDebugDirectIO(bool enabled)
 {
     _debugDirectIO = enabled;
@@ -2322,6 +2328,12 @@ bool DownloadThread::_customizeImage()
             }
 
             fat->writeFile("config.txt", config);
+        }
+
+        // Write extra boot files (e.g., CyberFold device tree overlays)
+        for (const auto &[path, data] : _extraBootFiles) {
+            qDebug() << "Writing extra boot file:" << path << "(" << data.size() << "bytes)";
+            fat->writeFile(path, data);
         }
 
         // init_format decision is owned by ImageWriter; no auto-detection here

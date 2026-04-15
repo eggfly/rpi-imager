@@ -643,5 +643,73 @@ QByteArray CustomisationGenerator::generateCloudInitNetworkConfig(const QVariant
     return netcfg;
 }
 
+QByteArray CustomisationGenerator::generateCyberFoldMonitorInstall(const QByteArray &monitorScript)
+{
+    QByteArray script;
+    auto line = [](const QString& l, QByteArray& out) { out += l.toUtf8(); out += '\n'; };
+
+    line(QStringLiteral(""), script);
+    line(QStringLiteral("# === CyberFold Power Monitor Installation ==="), script);
+
+    // Install dependencies
+    line(QStringLiteral("apt-get update -qq"), script);
+    line(QStringLiteral("apt-get install -y -qq python3-serial 2>/dev/null || true"), script);
+
+    // Install the monitor script
+    line(QStringLiteral("cat > /usr/bin/cyberfold_monitor <<'CFMON_EOF'"), script);
+    script += monitorScript;
+    if (!monitorScript.endsWith('\n'))
+        script += '\n';
+    line(QStringLiteral("CFMON_EOF"), script);
+    line(QStringLiteral("chmod +x /usr/bin/cyberfold_monitor"), script);
+
+    // Add user to dialout group for serial access
+    line(QStringLiteral("FIRSTUSER=$(getent passwd 1000 | cut -d: -f1)"), script);
+    line(QStringLiteral("if [ -n \"$FIRSTUSER\" ]; then usermod -aG dialout \"$FIRSTUSER\"; fi"), script);
+
+    // Install systemd user service (works for both desktop and console)
+    line(QStringLiteral("mkdir -p /usr/lib/systemd/user"), script);
+    line(QStringLiteral("cat > /usr/lib/systemd/user/cyberfold-monitor.service <<'SVCEOF'"), script);
+    line(QStringLiteral("[Unit]"), script);
+    line(QStringLiteral("Description=CyberFold Power Monitor"), script);
+    line(QStringLiteral("After=dev-ttyACM0.device"), script);
+    line(QStringLiteral(""), script);
+    line(QStringLiteral("[Service]"), script);
+    line(QStringLiteral("Type=simple"), script);
+    line(QStringLiteral("ExecStart=/usr/bin/cyberfold_monitor --daemon"), script);
+    line(QStringLiteral("Restart=on-failure"), script);
+    line(QStringLiteral("RestartSec=5"), script);
+    line(QStringLiteral(""), script);
+    line(QStringLiteral("[Install]"), script);
+    line(QStringLiteral("WantedBy=default.target"), script);
+    line(QStringLiteral("SVCEOF"), script);
+
+    // Desktop autostart (only if desktop sessions exist)
+    line(QStringLiteral("if [ -d /usr/share/xsessions ] || [ -d /usr/share/wayland-sessions ]; then"), script);
+    line(QStringLiteral("  apt-get install -y -qq python3-gi gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 2>/dev/null || true"), script);
+    line(QStringLiteral("  mkdir -p /etc/xdg/autostart"), script);
+    line(QStringLiteral("  cat > /etc/xdg/autostart/cyberfold-monitor.desktop <<'DTEOF'"), script);
+    line(QStringLiteral("[Desktop Entry]"), script);
+    line(QStringLiteral("Type=Application"), script);
+    line(QStringLiteral("Name=CyberFold Power Monitor"), script);
+    line(QStringLiteral("Exec=/usr/bin/cyberfold_monitor --tray"), script);
+    line(QStringLiteral("Icon=battery-full"), script);
+    line(QStringLiteral("Categories=System;Monitor;"), script);
+    line(QStringLiteral("X-GNOME-Autostart-enabled=true"), script);
+    line(QStringLiteral("NoDisplay=true"), script);
+    line(QStringLiteral("DTEOF"), script);
+    line(QStringLiteral("fi"), script);
+
+    // Enable systemd user service for first user
+    line(QStringLiteral("if [ -n \"$FIRSTUSER\" ]; then"), script);
+    line(QStringLiteral("  FIRSTUSERHOME=$(getent passwd 1000 | cut -d: -f6)"), script);
+    line(QStringLiteral("  mkdir -p \"$FIRSTUSERHOME/.config/systemd/user/default.target.wants\""), script);
+    line(QStringLiteral("  ln -sf /usr/lib/systemd/user/cyberfold-monitor.service \"$FIRSTUSERHOME/.config/systemd/user/default.target.wants/cyberfold-monitor.service\""), script);
+    line(QStringLiteral("  chown -R \"$FIRSTUSER:$FIRSTUSER\" \"$FIRSTUSERHOME/.config/systemd\" 2>/dev/null || true"), script);
+    line(QStringLiteral("fi"), script);
+
+    return script;
+}
+
 } // namespace rpi_imager
 

@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""CyberFold Power Monitor - System Tray & CLI
+
+Usage:
+  cyberfold_monitor           Auto-detect mode (tray if desktop, CLI otherwise)
+  cyberfold_monitor --tray    Force system tray mode (GTK3 + AppIndicator)
+  cyberfold_monitor --cli     Force CLI mode (terminal output)
+  cyberfold_monitor --daemon  Daemon mode (log to syslog, no UI)
+  cyberfold_monitor --version Print version
+"""
+
+import serial
+import threading
+import json
+import sys
+import os
+import time
+import subprocess
+from collections import deque
+
+VERSION = "1.0.0"
+CONFIG_PATH = os.path.expanduser("~/.config/cyberfold/monitor.json")
+CANDIDATE_PORTS = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyACM2"]
+CHARGER_EFFICIENCY = 0.77
+
+# ==================== Config ====================
+
+def load_config():
+    defaults = {"capacity_mah": 0}
+    try:
+        with open(CONFIG_PATH) as f:
+            defaults.update(json.load(f))
+    except Exception:
+        pass
+    return defaults
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+# ==================== PowerData ====================
+
+class PowerData:
+    def __init__(self):
+        self.max17048_v = 0.0
+        self.max17048_soc = 0.0
+        self.ina_vbat_bus = 0.0
+        self.ina_vbat_current = 0.0
+        self.ina_vbat_power = 0.0
+        self.ina_vbus_bus = 0.0
+        self.ina_vbus_current = 0.0
+        self.ina_vbus_power = 0.0
+        self.cw2015_v = 0.0
+        self.cw2015_soc = 0.0
+        self.timestamp = time.time()
+
+    @property
+    def vbus_effective_power(self):
+        return self.ina_vbus_power * CHARGER_EFFICIENCY
+
+    @property
+    def is_charging(self):
+        return self.vbus_effective_power > self.ina_vbat_power + 0.1
+
+    @property
+    def charge_power(self):
+        return self.vbus_effective_power - self.ina_vbat_power
+
+    @property
+    def soc(self):
+        if self.cw2015_soc > 0:
+            return self.cw2015_soc
+        if self.max17048_soc > 0:
+            return self.max17048_soc
+        return 0.0
+
+# ==================== Serial Reader ====================
+
+class SerialReader(threading.Thread):
+    def __init__(self, port=None, baud=115200):
+        super().__init__(daemon=True)
+        self.port = port
+        self.baud = baud
+        self.data = PowerData()
+        self.lock = threading.Lock()
+        self.running = True
+        self.history_soc = deque(maxlen=600)
+        self.history_power = deque(maxlen=600)
+        self.history_voltage = deque(maxlen=600)
+        self.history_time = deque(maxlen=600)
+        self.connected = False
+
+    def _find_port(self):
+        if self.port:
+            return self.port
+        for p in CANDIDATE_PORTS:
+            if os.path.exists(p):
+                return p
+        return CANDIDATE_PORTS[0]
+
+    def run(self):
+        while self.running:
+            try:
+                port = self._find_port()
+                ser = serial.Serial(port, self.baud, timeout=2)
+                self.connected = True
+                while self.running:
+                    raw = ser.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    if line == "SHUTDOWN":
+                        import syslog
+                        syslog.syslog(syslog.LOG_WARNING, "CyberFold: ESP32 requested shutdown")
+                        subprocess.Popen(["sudo", "halt"])
+                        continue
+                    if not line or not line.startswith("{"):
+                        continue
+                    try:
+                        j = json.loads(line)
+                        d = PowerData()
+                        if "max" in j:
+                            d.max17048_v = j["max"]["v"]
+                            d.max17048_soc = j["max"]["soc"]
+                        d.ina_vbat_bus = j["vbat"]["v"]
+                        d.ina_vbat_current = j["vbat"]["i"]
+                        d.ina_vbat_power = j["vbat"]["p"]
+                        d.ina_vbus_bus = j["vbus"]["v"]
+                        d.ina_vbus_current = j["vbus"]["i"]
+                        d.ina_vbus_power = j["vbus"]["p"]
+                        d.cw2015_v = j["cw"]["v"] * 1000
+                        d.cw2015_soc = j["cw"]["soc"]
+                        d.timestamp = time.time()
+                        with self.lock:
+                            self.data = d
+                            self.history_time.append(d.timestamp)
+                            self.history_soc.append(d.soc)
+                            self.history_power.append(
+                                d.charge_power if d.is_charging else -d.ina_vbat_power)
+                            self.history_voltage.append(
+                                d.cw2015_v / 1000.0 if d.cw2015_v > 0 else d.max17048_v)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+            except Exception:
+                self.connected = False
+                time.sleep(2)
+
+    def get_data(self):
+        with self.lock:
+            return self.data
+
+    def get_history(self):
+        with self.lock:
+            return (list(self.history_time), list(self.history_soc),
+                    list(self.history_power), list(self.history_voltage))
+
+# ==================== Battery Estimator ====================
+
+class BatteryEstimator:
+    def __init__(self, config):
+        self.config = config
+        self.avg_discharge_a = 0.0
+        self.avg_charge_a = 0.0
+        self.alpha = 0.1
+
+    def update(self, d):
+        cap = self.config.get("capacity_mah", 0)
+        soc = d.soc
+        if d.is_charging:
+            if d.ina_vbat_bus > 0.1:
+                net_charge_a = d.charge_power / d.ina_vbat_bus
+            else:
+                net_charge_a = 0
+            self.avg_charge_a = self.avg_charge_a * (1 - self.alpha) + net_charge_a * self.alpha
+            self.avg_discharge_a = 0
+        else:
+            self.avg_discharge_a = self.avg_discharge_a * (1 - self.alpha) + d.ina_vbat_current * self.alpha
+            self.avg_charge_a = 0
+
+        result = {"capacity_mah": cap, "remain_mah": 0, "remain_min": 0, "time_str": ""}
+        if cap <= 0 or soc <= 0:
+            result["time_str"] = "Set battery capacity"
+            return result
+
+        remain_mah = cap * soc / 100.0
+        result["remain_mah"] = remain_mah
+        if d.is_charging:
+            need_mah = cap * (100.0 - soc) / 100.0
+            if self.avg_charge_a > 0.01:
+                mins = need_mah / (self.avg_charge_a * 1000.0) * 60.0
+                result["time_str"] = f"{remain_mah:.0f}mAh  full in ~{_fmt_mins(mins)}"
+            else:
+                result["time_str"] = f"{remain_mah:.0f}mAh  calculating..."
+        else:
+            if self.avg_discharge_a > 0.01:
+                mins = remain_mah / (self.avg_discharge_a * 1000.0) * 60.0
+                result["remain_min"] = mins
+                result["time_str"] = f"{remain_mah:.0f}mAh  ~{_fmt_mins(mins)} left"
+            else:
+                result["time_str"] = f"{remain_mah:.0f}mAh"
+        return result
+
+def _fmt_mins(mins):
+    mins = int(mins)
+    if mins >= 60:
+        h, m = divmod(mins, 60)
+        return f"{h}h{m:02d}m"
+    return f"{mins}min"
+
+# ==================== System Info ====================
+
+def _read_file(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+def get_system_info():
+    si = {}
+    freq = _read_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+    si["cpu_freq"] = int(freq) // 1000 if freq else 0
+    si["cpu_cores"] = os.cpu_count() or 0
+    t = _read_file("/sys/class/thermal/thermal_zone0/temp")
+    si["cpu_temp"] = int(t) / 1000.0 if t else 0.0
+    try:
+        r = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=2)
+        tval = r.stdout.strip().split("=")[-1]
+        si["throttled"] = int(tval, 16) if tval.startswith("0x") else int(tval)
+    except Exception:
+        si["throttled"] = -1
+    try:
+        with open("/proc/meminfo") as f:
+            mi = {}
+            for l in f:
+                p = l.split()
+                if len(p) >= 2:
+                    mi[p[0].rstrip(":")] = int(p[1])
+        si["mem_total"] = mi.get("MemTotal", 0) // 1024
+        si["mem_used"] = si["mem_total"] - mi.get("MemAvailable", 0) // 1024
+    except Exception:
+        si["mem_total"] = si["mem_used"] = 0
+    return si
+
+def throttle_str(val):
+    if val <= 0:
+        return "OK"
+    flags = []
+    if val & 0x1: flags.append("UV")
+    if val & 0x2: flags.append("FREQ-CAP")
+    if val & 0x4: flags.append("THROTTLED")
+    if val & 0x8: flags.append("SOFT-TEMP")
+    return " ".join(flags) if flags else "OK"
+
+# ==================== CLI Mode ====================
+
+def run_cli(reader, config):
+    estimator = BatteryEstimator(config)
+    print("CyberFold Power Monitor v{} (CLI mode)".format(VERSION))
+    print("Waiting for ESP32-S3 data on /dev/ttyACM*...")
+    print("-" * 60)
+    try:
+        while True:
+            d = reader.get_data()
+            soc = d.soc
+            charging = d.is_charging
+            est = estimator.update(d)
+            si = get_system_info()
+
+            sym = "CHG" if charging else "DIS"
+            status = f"[{sym}] SOC: {soc:.1f}%"
+            if charging:
+                status += f"  +{d.charge_power:.2f}W"
+            else:
+                status += f"  -{d.ina_vbat_power:.2f}W"
+
+            line = (
+                f"{status}  |  "
+                f"VBAT: {d.ina_vbat_bus:.2f}V {d.ina_vbat_current:.2f}A  |  "
+                f"VBUS: {d.ina_vbus_bus:.2f}V {d.ina_vbus_current:.2f}A  |  "
+                f"CPU: {si['cpu_temp']:.0f}C {si['cpu_freq']}MHz  |  "
+                f"{est['time_str']}"
+            )
+            # Overwrite line in terminal
+            print(f"\r{line:<120}", end="", flush=True)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nExiting.")
+
+# ==================== Daemon Mode ====================
+
+def run_daemon(reader, config):
+    import syslog
+    syslog.openlog("cyberfold_monitor", syslog.LOG_PID, syslog.LOG_DAEMON)
+    syslog.syslog(syslog.LOG_INFO, f"CyberFold Power Monitor v{VERSION} starting in daemon mode")
+    estimator = BatteryEstimator(config)
+    low_warned = False
+    crit_warned = False
+    try:
+        while True:
+            d = reader.get_data()
+            soc = d.soc
+            est = estimator.update(d)
+
+            if not d.is_charging and soc > 0:
+                if soc <= 10 and not crit_warned:
+                    crit_warned = True
+                    syslog.syslog(syslog.LOG_CRIT, f"Battery critical: {soc:.0f}%")
+                elif soc <= 20 and not low_warned:
+                    low_warned = True
+                    syslog.syslog(syslog.LOG_WARNING, f"Battery low: {soc:.0f}%")
+                if soc <= 5:
+                    syslog.syslog(syslog.LOG_EMERG, f"Battery at {soc:.0f}%, initiating shutdown")
+                    subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+            elif d.is_charging:
+                low_warned = False
+                crit_warned = False
+
+            time.sleep(1)
+    except KeyboardInterrupt:
+        syslog.syslog(syslog.LOG_INFO, "Stopping")
+
+# ==================== Tray Mode ====================
+
+def run_tray(reader, config):
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        gi.require_version("Notify", "0.7")
+        from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator, Notify
+    except (ImportError, ValueError) as e:
+        print(f"Desktop dependencies not available: {e}", file=sys.stderr)
+        print("Falling back to CLI mode.", file=sys.stderr)
+        run_cli(reader, config)
+        return
+
+    Notify.init("CyberFold Power")
+    estimator = BatteryEstimator(config)
+
+    indicator = AppIndicator.Indicator.new(
+        "cyberfold-power", "battery-full", AppIndicator.IndicatorCategory.HARDWARE)
+    indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+    indicator.set_title("CyberFold Power")
+    indicator.set_label("BAT --%", "")
+
+    menu = Gtk.Menu()
+    current_icon = [None]
+    low_warned = [False]
+    crit_warned = [False]
+
+    def add_info(label):
+        item = Gtk.MenuItem(label=label)
+        item.set_sensitive(False)
+        menu.append(item)
+        return item
+
+    item_soc = add_info("SOC: ---%")
+    item_est = add_info("---")
+    menu.append(Gtk.SeparatorMenuItem())
+    item_vbat = add_info("VBAT: ---")
+    item_vbus = add_info("VBUS: ---")
+    menu.append(Gtk.SeparatorMenuItem())
+    item_cpu = add_info("CPU: ---")
+    item_mem = add_info("Mem: ---")
+    menu.append(Gtk.SeparatorMenuItem())
+
+    item_quit = Gtk.MenuItem(label="Quit")
+    item_quit.connect("activate", lambda w: (Notify.uninit(), Gtk.main_quit()))
+    menu.append(item_quit)
+    menu.show_all()
+    indicator.set_menu(menu)
+
+    def get_battery_icon(soc, charging):
+        if charging:
+            if soc >= 80: return "battery-full-charging"
+            if soc >= 50: return "battery-good-charging"
+            if soc >= 20: return "battery-low-charging"
+            return "battery-caution-charging"
+        if soc >= 80: return "battery-full"
+        if soc >= 50: return "battery-good"
+        if soc >= 20: return "battery-low"
+        if soc >= 5: return "battery-caution"
+        return "battery-empty"
+
+    def update():
+        d = reader.get_data()
+        soc = d.soc
+        charging = d.is_charging
+        icon_name = get_battery_icon(soc, charging)
+        if icon_name != current_icon[0]:
+            indicator.set_icon_full(icon_name, f"{soc:.0f}%")
+            current_icon[0] = icon_name
+
+        sym = "\u26a1" if charging else "\u25bc"
+        indicator.set_label(f"{sym} {soc:.0f}%", "")
+
+        if not reader.connected:
+            item_soc.set_label("SOC: --- (disconnected)")
+        elif charging:
+            item_soc.set_label(f"\u26a1 SOC: {soc:.1f}%  Charging +{d.charge_power:.2f}W")
+        else:
+            item_soc.set_label(f"\u25bc SOC: {soc:.1f}%  Discharging {d.ina_vbat_power:.2f}W")
+
+        est = estimator.update(d)
+        item_est.set_label(est["time_str"])
+        item_vbat.set_label(f"VBAT: {d.ina_vbat_bus:.3f}V  {d.ina_vbat_current:.2f}A  {d.ina_vbat_power:.2f}W")
+        item_vbus.set_label(f"VBUS: {d.ina_vbus_bus:.3f}V  {d.ina_vbus_current:.2f}A  {d.ina_vbus_power:.2f}W")
+
+        si = get_system_info()
+        item_cpu.set_label(f"CPU: {si['cpu_temp']:.1f}C  {si['cpu_freq']}MHz  Throt: {throttle_str(si['throttled'])}")
+        item_mem.set_label(f"Mem: {si['mem_used']}MB / {si['mem_total']}MB")
+
+        # Low battery notifications
+        if not charging and soc > 0:
+            if soc <= 20 and not low_warned[0]:
+                low_warned[0] = True
+                try:
+                    Notify.Notification.new("Low Battery", f"Battery at {soc:.0f}%", "battery-caution").show()
+                except Exception:
+                    pass
+            if soc <= 10 and not crit_warned[0]:
+                crit_warned[0] = True
+                try:
+                    Notify.Notification.new("Critical Battery", f"Battery at {soc:.0f}%! Shutdown at 5%", "battery-empty").show()
+                except Exception:
+                    pass
+            if soc <= 5:
+                subprocess.Popen(["sudo", "shutdown", "-h", "+1", "Battery critical"])
+        elif charging:
+            low_warned[0] = False
+            crit_warned[0] = False
+
+        return True
+
+    GLib.timeout_add(1000, update)
+    Gtk.main()
+
+# ==================== Main ====================
+
+def has_desktop():
+    return os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+
+def main():
+    if "--version" in sys.argv:
+        print(f"cyberfold_monitor {VERSION}")
+        return
+
+    config = load_config()
+    reader = SerialReader()
+    reader.start()
+
+    if "--daemon" in sys.argv:
+        run_daemon(reader, config)
+    elif "--cli" in sys.argv:
+        run_cli(reader, config)
+    elif "--tray" in sys.argv:
+        run_tray(reader, config)
+    else:
+        if has_desktop():
+            run_tray(reader, config)
+        else:
+            run_cli(reader, config)
+
+if __name__ == "__main__":
+    main()

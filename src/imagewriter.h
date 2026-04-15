@@ -72,6 +72,8 @@ public:
 
     Q_PROPERTY(WriteState writeState READ writeState NOTIFY writeStateChanged)
     Q_PROPERTY(bool isOsListUnavailable READ isOsListUnavailable NOTIFY osListUnavailableChanged)
+    Q_PROPERTY(bool isCyberFoldDevice READ isCyberFoldDevice NOTIFY cyberFoldDeviceChanged)
+    Q_PROPERTY(bool isCyberFoldWithWifi READ isCyberFoldWithWifi NOTIFY cyberFoldDeviceChanged)
 
     /* Returns true if the extract size is reliably known (false for gz files which can't store sizes >4GB) */
     Q_INVOKABLE bool isExtractSizeKnown() const { return _extractSizeKnown; }
@@ -225,6 +227,13 @@ public:
     Q_INVOKABLE quint64 getSelectedSourceSize();
     /* Format a byte size with an appropriate translated unit (KB/MB/GB/TB) */
     Q_INVOKABLE QString formatSize(quint64 bytes, int decimals = 1);
+
+    /* Returns true if a CyberFold device is selected */
+    Q_INVOKABLE bool isCyberFoldDevice() const { return _isCyberFold; }
+    /* Returns true if the CyberFold device has a WiFi antenna switch (CM4/CM5, not CM0) */
+    Q_INVOKABLE bool isCyberFoldWithWifi() const { return _isCyberFoldWithWifi; }
+    /* Update CyberFold device state from device name */
+    void updateCyberFoldState(const QString &deviceName);
 
     /* Returns true if online */
     Q_INVOKABLE bool isOnline();
@@ -393,6 +402,7 @@ signals:
     void keychainPermissionRequested();
     void keychainPermissionResponseReceived();
     void writeStateChanged();
+    void cyberFoldDeviceChanged();
     void connectTokenReceived(const QString &token);
     void connectTokenConflictDetected(const QString &token);
     void connectTokenCleared();
@@ -482,6 +492,10 @@ protected:
     int _refreshJitterOverrideMinutes;
     // Session-only storage for Raspberry Pi Connect token
     QString _piConnectToken;
+    // CyberFold device detection and overlay data
+    bool _isCyberFold = false;
+    bool _isCyberFoldWithWifi = false;
+    QList<QPair<QString, QByteArray>> _extraBootFiles;
     // CLI flag to force enable secure boot regardless of OS capabilities
     static bool _forceSecureBootEnabled;
 #ifndef CLI_ONLY_BUILD
@@ -530,6 +544,8 @@ protected:
     QString _sshKeyGen();
     void _applySystemdCustomisationFromSettings(const QVariantMap &s);
     void _applyCloudInitCustomisationFromSettings(const QVariantMap &s);
+    QByteArray _buildCyberFoldConfigLines(const QVariantMap &s);
+    void _loadCyberFoldOverlays();
     void _continueStartWriteAfterCacheVerification(bool cacheIsValid);
     void scheduleOsListRefresh();
     void _handleMemoryAllocationFailure(const char* what);

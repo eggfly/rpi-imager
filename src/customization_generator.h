@@ -62,6 +62,13 @@ public:
     static QByteArray generateCloudInitNetworkConfig(const QVariantMap& settings,
                                                     bool hasCcRpi = false);
 
+    /**
+     * @brief Generate CyberFold-specific firstrun.sh content for power monitor installation
+     *
+     * @return QByteArray containing shell script content to install cyberfold_monitor
+     */
+    static QByteArray generateCyberFoldMonitorInstall(const QByteArray &monitorScript);
+
 private:
     /**
      * @brief Shell-quote a string for safe use in bash scripts

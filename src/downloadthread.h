@@ -124,6 +124,7 @@ public:
      * Enable image customization
      */
     void setImageCustomisation(const QByteArray &config, const QByteArray &cmdline, const QByteArray &firstrun, const QByteArray &cloudinit, const QByteArray &cloudinitNetwork, const QByteArray &initFormat, const ImageOptions::AdvancedOptions opts);
+    void setExtraBootFiles(const QList<QPair<QString, QByteArray>> &files);
 
     /*
      * Debug options (set before starting the thread)
@@ -271,6 +272,7 @@ protected:
     std::uint64_t _lastFailureOffset;
     qint64 _sectorsStart;
     QByteArray _url, _useragent, _buf, _filename, _lastError, _expectedHash, _config, _cmdline, _firstrun, _cloudinit, _cloudinitNetwork, _initFormat;
+    QList<QPair<QString, QByteArray>> _extraBootFiles;  // Additional files to write to boot partition (e.g., overlays/)
     ImageOptions::AdvancedOptions _advancedOptions;
     char *_firstBlock;
     size_t _firstBlockSize;

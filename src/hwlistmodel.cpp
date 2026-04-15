@@ -54,7 +54,7 @@ bool HWListModel::reload()
             {"CyberFold CM4", "With 1024x768 Touch Screen Driver",
              QJsonArray({"pi4-64bit", "pi4-32bit"})},
             {"CyberFold CM0", "With 1024x768 Touch Screen Driver",
-             QJsonArray({"pi1-32bit"})},
+             QJsonArray({"pi3-64bit", "pi3-32bit"})},
         };
         for (const auto &cf : cyberFoldDevices) {
             HardwareDevice hw = {
@@ -64,9 +64,7 @@ bool HWListModel::reload()
                 QStringLiteral("../icons/cyberfold_yellow.png"),
                 QString::fromUtf8(cf.desc),
                 QStringLiteral("exclusive"),
-                cf.tags.first().toString().contains("pi5") ? QStringLiteral("armv8") :
-                cf.tags.first().toString().contains("pi4") ? QStringLiteral("armv8") :
-                QStringLiteral("armhf")
+                QStringLiteral("armv8")
             };
             _hwDevices.append(hw);
         }
@@ -206,6 +204,7 @@ void HWListModel::setCurrentIndex(int index) {
     
     _imageWriter.setHWFilterList(device.tags, device.isInclusive());
     _imageWriter.setHWCapabilitiesList(device.capabilities);
+    _imageWriter.updateCyberFoldState(device.name);
     
     if (deviceChanged) {
         qDebug() << "Hardware device changed from" << _lastSelectedDeviceName << "to" << device.name << "- clearing image selection";
