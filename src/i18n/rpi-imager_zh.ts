@@ -3189,7 +3189,7 @@ Please check your storage device and try again.</source>
     </message>
     <message>
         <source>Raspberry Pi Imager %1</source>
-        <translation>树莓派启动盘制作工具（Raspberry Pi Imager） %1</translation>
+        <translation>树莓派系统盘制作工具 - CyberFold 专用驱动版（Raspberry Pi Imager） %1</translation>
     </message>
     <message>
         <source>Insufficient Permissions</source>

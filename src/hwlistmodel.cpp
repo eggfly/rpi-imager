@@ -44,7 +44,34 @@ bool HWListModel::reload()
     _hwDevices.clear();
 
     const QJsonArray deviceArray = devices.toArray();
-    _hwDevices.reserve(deviceArray.size());
+    _hwDevices.reserve(deviceArray.size() + 3);
+
+    // Inject CyberFold custom devices at the top of the list
+    {
+        struct { const char *name; const char *desc; QJsonArray tags; } cyberFoldDevices[] = {
+            {"CyberFold CM5", "With 1024x768 Touch Screen Driver",
+             QJsonArray({"pi5-64bit", "pi5-32bit"})},
+            {"CyberFold CM4", "With 1024x768 Touch Screen Driver",
+             QJsonArray({"pi4-64bit", "pi4-32bit"})},
+            {"CyberFold CM0", "With 1024x768 Touch Screen Driver",
+             QJsonArray({"pi1-32bit"})},
+        };
+        for (const auto &cf : cyberFoldDevices) {
+            HardwareDevice hw = {
+                QString::fromUtf8(cf.name),
+                cf.tags,
+                QJsonArray({"i2c", "spi", "onewire", "serial"}),
+                QStringLiteral("../icons/cyberfold_yellow.png"),
+                QString::fromUtf8(cf.desc),
+                QStringLiteral("exclusive"),
+                cf.tags.first().toString().contains("pi5") ? QStringLiteral("armv8") :
+                cf.tags.first().toString().contains("pi4") ? QStringLiteral("armv8") :
+                QStringLiteral("armhf")
+            };
+            _hwDevices.append(hw);
+        }
+    }
+
     int indexOfDefault = -1;
     for (const QJsonValue &deviceValue: deviceArray) {
         QJsonObject deviceObj = deviceValue.toObject();

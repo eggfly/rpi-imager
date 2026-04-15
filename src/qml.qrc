@@ -40,6 +40,12 @@
         <file>icons/logo_stacked_imager.png</file>
         <file>icons/logo_sxs_imager.png</file>
         <file>icons/cat_digital_signage.png</file>
+        <file>icons/cyberfold.png</file>
+        <file>icons/cyberfold_3ds.png</file>
+        <file>icons/cyberfold_fold.png</file>
+        <file>icons/cyberfold_side.png</file>
+        <file>icons/cyberfold_minimal.png</file>
+        <file>icons/cyberfold_yellow.png</file>
         <file>qmlcomponents/ImOptionPill.qml</file>
         <file>qmlcomponents/ImTextField.qml</file>
         <file>qmlcomponents/ImPasswordField.qml</file>
